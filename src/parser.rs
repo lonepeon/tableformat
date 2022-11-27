@@ -1,170 +1,316 @@
-#[derive(Debug)]
-pub struct Error(String);
+use crate::table;
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "failed to parse table: {}", self.0)
+pub fn parse(content: &str) -> Result<table::Table, table::Error> {
+    let mut t = table::Table::default();
+    let mut content = parse_column_names(&mut t, content)?;
+    let new_content = parse_delimiter_line(&mut t, content)?;
+    if let Some(new_content) = new_content {
+        content = new_content
     }
+    parse_rows(&mut t, content)?;
+
+    Ok(t)
 }
 
-impl std::error::Error for Error {}
-
-impl std::convert::From<String> for Error {
-    fn from(msg: String) -> Self {
-        Self(msg)
-    }
+fn next(content: &str) -> (Option<char>, &str) {
+    let mut chars = content.chars();
+    (chars.next(), chars.as_str())
 }
 
-impl std::convert::From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Self {
-        Self(err.to_string())
-    }
+fn peek(content: &str) -> Option<char> {
+    content.chars().next()
 }
 
-impl std::convert::From<Error> for std::io::Error {
-    fn from(err: Error) -> Self {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, err)
-    }
+fn skip_spaces(content: &str) -> &str {
+    content.trim()
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub enum Alignment {
-    Left,
-    Right,
-    Centered,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub struct Column<'a> {
-    name: Option<&'a str>,
-    alignment: Option<Alignment>,
-    values: Vec<Option<&'a str>>,
-}
-
-#[derive(Debug, Eq, PartialEq, Default)]
-pub struct Table<'a> {
-    current_row: usize,
-    current_column: usize,
-    columns: Vec<Column<'a>>,
-}
-
-impl<'a> Table<'a> {
-    pub fn push(&mut self, value: &'a str) {
-        if self.current_column == self.columns.len() {
-            self.columns.push(Column {
-                name: None,
-                alignment: None,
-                values: vec![None; self.current_row],
-            });
+fn read_until(content: &str, c: char) -> (Option<&str>, &str) {
+    for (index, current) in content.chars().enumerate() {
+        if current == c {
+            return (Some(&content[0..index]), &content[index..]);
         }
-        self.columns[self.current_column].values.push(Some(value));
-        self.current_column += 1;
     }
 
-    pub fn next_row(&mut self) {
-        while self.current_column != self.columns.len() {
-            self.columns[self.current_column].values.push(None);
-            self.current_column += 1;
-        }
-        self.current_row += 1;
-        self.current_column = 0;
-    }
-
-    pub fn add_column(&mut self, name: Option<&'a str>, alignment: Option<Alignment>) {
-        self.columns.push(Column {
-            name,
-            alignment,
-            values: Vec::new(),
-        })
-    }
+    (None, content)
 }
 
-impl<'a> std::convert::TryFrom<String> for Table<'a> {
-    type Error = Error;
+fn parse_column_names<'a>(
+    t: &mut table::Table<'a>,
+    content: &'a str,
+) -> Result<&'a str, table::Error> {
+    let mut content = skip_spaces(content);
+    while let (Some(c), new_content) = next(content) {
+        content = new_content;
+        match c {
+            '|' => {
+                if let Some(c) = peek(content) {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+                let (column, new_content) = parse_column(content)?;
+                content = new_content;
 
-    fn try_from(_content: String) -> Result<Self, Self::Error> {
-        Err("not implemented yet".to_string().into())
+                t.add_column(column, None)
+            }
+            c => Err(table::Error::from(format!(
+                "expecting header definition surrounded by | but found {}",
+                c
+            )))?,
+        }
+    }
+
+    Ok(content)
+}
+
+fn parse_delimiter_line<'a>(
+    t: &mut table::Table<'a>,
+    content: &'a str,
+) -> Result<Option<&'a str>, table::Error> {
+    let mut abort = false;
+    let mut index = 0;
+    let mut content = skip_spaces(content);
+    while let (Some(c), new_content) = next(content) {
+        content = new_content;
+        match c {
+            '|' => {
+                if let Some(c) = peek(content) {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+                let (column, new_content) = parse_column(content)?;
+                content = new_content;
+
+                if let Some(column) = column {
+                    if column.starts_with(':') && column.ends_with(':') {
+                        t.columns[index].alignment = Some(table::Alignment::Centered);
+                    } else if column.starts_with(':') {
+                        t.columns[index].alignment = Some(table::Alignment::Left);
+                    } else if column.ends_with(':') {
+                        t.columns[index].alignment = Some(table::Alignment::Right);
+                    } else if column.starts_with('-') {
+                        t.columns[index].alignment = None;
+                    } else {
+                        abort = true;
+                        break;
+                    }
+                } else {
+                    abort = true;
+                    break;
+                }
+                index += 1;
+            }
+            c => Err(table::Error::from(format!(
+                "expecting header delimiter definition surrounded by | but found {}",
+                c
+            )))?,
+        }
+    }
+
+    if abort {
+        t.no_headers = true;
+        for i in 0..t.columns.len() {
+            t.columns[i].alignment = None;
+            t.push(t.columns[i].name);
+            t.columns[i].name = None;
+        }
+        t.next_row();
+        return Ok(None);
+    }
+
+    Ok(Some(content))
+}
+
+fn parse_rows<'a>(t: &mut table::Table<'a>, content: &'a str) -> Result<(), table::Error> {
+    let mut content = skip_spaces(content);
+    while let (Some(c), new_content) = next(content) {
+        content = new_content;
+        if content.is_empty() {
+            break;
+        }
+        match c {
+            '|' => {
+                if let Some(c) = peek(content) {
+                    if c == '\n' {
+                        let (_, new_content) = next(content);
+                        content = new_content;
+                        t.next_row();
+                        continue;
+                    }
+                }
+                let (column, new_content) = parse_column(content)?;
+                content = new_content;
+
+                t.push(column)
+            }
+            c => Err(table::Error::from(format!(
+                "expecting body definition surrounded by | but found {}",
+                c
+            )))?,
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_column(content: &str) -> Result<(Option<&str>, &str), table::Error> {
+    let (column, new_content) = read_until(content, '|');
+    let column_name =
+        column.ok_or_else(|| table::Error::from("failed to find closing |".to_string()))?;
+    let column_name = column_name.trim();
+    if column_name.is_empty() {
+        Ok((None, new_content))
+    } else {
+        Ok((Some(column_name), new_content))
     }
 }
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
 
     #[test]
-    fn add_column_existing_lines() {
-        let mut actual = Table::default();
-        actual.add_column(Some("column 1"), None);
-        actual.add_column(Some("column 2"), Some(Alignment::Left));
-        actual.push("value 1.1");
-        actual.push("value 1.2");
-        actual.next_row();
-        actual.push("value 2.1");
-        actual.push("value 2.2");
+    fn parse_valid_table_with_header() {
+        let content = "| column 1  | column 2    |                  |              column 4 |
+|-----------|:------------|:----------------:|----------------------:|
+| value 1.1 | a value 1.2 | a long value 1.3 | a long long value 1.4 |
+| value 2.1 | value 2.2   |                  |                       |
+| value 3.1 | value 3.2   |    value 3.3     |             value 3.4 |
+";
 
-        let expected = vec![
-            Column {
-                name: Some("column 1"),
-                alignment: None,
-                values: vec![Some("value 1.1"), Some("value 2.1")],
-            },
-            Column {
-                name: Some("column 2"),
-                alignment: Some(Alignment::Left),
-                values: vec![Some("value 1.2"), Some("value 2.2")],
-            },
-        ];
+        let t = parse(content).unwrap();
+        assert_eq!(4, t.columns.len(), "number of columns");
 
-        assert_eq!(expected, actual.columns)
+        assert_eq!(Some("column 1"), t.columns[0].name);
+        assert_eq!(Some("column 2"), t.columns[1].name);
+        assert_eq!(None, t.columns[2].name);
+        assert_eq!(Some("column 4"), t.columns[3].name);
+
+        assert_eq!(None, t.columns[0].alignment);
+        assert_eq!(Some(table::Alignment::Left), t.columns[1].alignment);
+        assert_eq!(Some(table::Alignment::Centered), t.columns[2].alignment);
+        assert_eq!(Some(table::Alignment::Right), t.columns[3].alignment);
+
+        assert_eq!(3, t.columns[0].values.len());
+        assert_eq!(Some("value 1.1"), t.columns[0].values[0]);
+        assert_eq!(Some("value 2.1"), t.columns[0].values[1]);
+        assert_eq!(Some("value 3.1"), t.columns[0].values[2]);
+
+        assert_eq!(3, t.columns[1].values.len());
+        assert_eq!(Some("a value 1.2"), t.columns[1].values[0]);
+        assert_eq!(Some("value 2.2"), t.columns[1].values[1]);
+        assert_eq!(Some("value 3.2"), t.columns[1].values[2]);
+
+        assert_eq!(3, t.columns[2].values.len());
+        assert_eq!(Some("a long value 1.3"), t.columns[2].values[0]);
+        assert_eq!(None, t.columns[2].values[1]);
+        assert_eq!(Some("value 3.3"), t.columns[2].values[2]);
+
+        assert_eq!(3, t.columns[3].values.len());
+        assert_eq!(Some("a long long value 1.4"), t.columns[3].values[0]);
+        assert_eq!(None, t.columns[3].values[1]);
+        assert_eq!(Some("value 3.4"), t.columns[3].values[2]);
     }
 
     #[test]
-    fn add_column_missing_columns() {
-        let mut actual = Table::default();
-        actual.add_column(Some("column 1"), None);
-        actual.add_column(Some("column 2"), Some(Alignment::Left));
-        actual.push("value 1.1");
-        actual.push("value 1.2");
-        actual.next_row();
-        actual.push("value 2.1");
-        actual.push("value 2.2");
-        actual.push("value 2.3");
-        actual.next_row();
-        actual.push("value 3.1");
-        actual.next_row();
-        actual.push("value 4.1");
-        actual.push("value 4.2");
-        actual.push("value 4.3");
+    fn parse_valid_table_no_header() {
+        let content = "| value 1.1 | a value 1.2 | a long value 1.3 | a long long value 1.4 |
+| value 2.1 | value 2.2   |                  |                       |
+| value 3.1 | value 3.2   |    value 3.3     |             value 3.4 |
+";
 
-        let expected = vec![
-            Column {
-                name: Some("column 1"),
-                alignment: None,
-                values: vec![
-                    Some("value 1.1"),
-                    Some("value 2.1"),
-                    Some("value 3.1"),
-                    Some("value 4.1"),
-                ],
-            },
-            Column {
-                name: Some("column 2"),
-                alignment: Some(Alignment::Left),
-                values: vec![
-                    Some("value 1.2"),
-                    Some("value 2.2"),
-                    None,
-                    Some("value 4.2"),
-                ],
-            },
-            Column {
-                name: None,
-                alignment: None,
-                values: vec![None, Some("value 2.3"), None, Some("value 4.3")],
-            },
-        ];
+        let t = parse(content).unwrap();
+        assert_eq!(4, t.columns.len(), "number of columns");
 
-        assert_eq!(expected, actual.columns)
+        assert_eq!(None, t.columns[0].name);
+        assert_eq!(None, t.columns[1].name);
+        assert_eq!(None, t.columns[2].name);
+        assert_eq!(None, t.columns[3].name);
+
+        assert_eq!(None, t.columns[0].alignment);
+        assert_eq!(None, t.columns[1].alignment);
+        assert_eq!(None, t.columns[2].alignment);
+        assert_eq!(None, t.columns[3].alignment);
+
+        assert_eq!(3, t.columns[0].values.len());
+        assert_eq!(Some("value 1.1"), t.columns[0].values[0]);
+        assert_eq!(Some("value 2.1"), t.columns[0].values[1]);
+        assert_eq!(Some("value 3.1"), t.columns[0].values[2]);
+
+        assert_eq!(3, t.columns[1].values.len());
+        assert_eq!(Some("a value 1.2"), t.columns[1].values[0]);
+        assert_eq!(Some("value 2.2"), t.columns[1].values[1]);
+        assert_eq!(Some("value 3.2"), t.columns[1].values[2]);
+
+        assert_eq!(3, t.columns[2].values.len());
+        assert_eq!(Some("a long value 1.3"), t.columns[2].values[0]);
+        assert_eq!(None, t.columns[2].values[1]);
+        assert_eq!(Some("value 3.3"), t.columns[2].values[2]);
+
+        assert_eq!(3, t.columns[3].values.len());
+        assert_eq!(Some("a long long value 1.4"), t.columns[3].values[0]);
+        assert_eq!(None, t.columns[3].values[1]);
+        assert_eq!(Some("value 3.4"), t.columns[3].values[2]);
+    }
+
+    #[test]
+    fn parse_column_with_text() {
+        assert_eq!(
+            (Some("column 1"), "| column 2 |"),
+            parse_column(" column 1 | column 2 |").unwrap()
+        )
+    }
+
+    #[test]
+    fn parse_column_no_text() {
+        assert_eq!(
+            (None, "| column 2 |"),
+            parse_column("| column 2 |").unwrap()
+        )
+    }
+
+    #[test]
+    fn skip_spaces_when_no_spaces() {
+        assert_eq!("no space", skip_spaces("no space"))
+    }
+
+    #[test]
+    fn skip_spaces_when_spaces_in_front() {
+        assert_eq!("with space", skip_spaces("   with space"))
+    }
+
+    #[test]
+    fn skip_spaces_when_spaces_in_back() {
+        assert_eq!("with space", skip_spaces("   with space   "))
+    }
+
+    #[test]
+    fn read_until_empty_string() {
+        assert_eq!((None, ""), read_until("", 'x'))
+    }
+
+    #[test]
+    fn read_until_no_match() {
+        assert_eq!((None, "this is a test"), read_until("this is a test", 'x'))
+    }
+
+    #[test]
+    fn read_until_fullmatch() {
+        assert_eq!(
+            (Some("this is a test"), "x"),
+            read_until("this is a testx", 'x')
+        )
+    }
+
+    #[test]
+    fn next_empty_string() {
+        assert_eq!((None, ""), next(""))
+    }
+
+    #[test]
+    fn next_non_empty_string() {
+        assert_eq!((Some('t'), "his is a test"), next("this is a test"))
     }
 }

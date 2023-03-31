@@ -1,3 +1,5 @@
+[![codecov](https://codecov.io/gh/lonepeon/tableformat/branch/main/graph/badge.svg?token=HC7WSVDRO2)](https://codecov.io/gh/lonepeon/tableformat)
+
 # Table format
 
 Small tool accepting a Markdown table as input and generating a new one properly aligned.
@@ -21,4 +23,3 @@ Small tool accepting a Markdown table as input and generating a new one properly
 ## Development
 
 - Setup your local environment using `make setup`
-- Run `make watch` to continuously run Clippy and the unit tests

@@ -19,8 +19,8 @@ jobs:
       - name: build application
         run: VERSION=${{ github.ref_name }} cargo build --verbose --release
       - name: rename binary
-        run: mv target/release/BINARY_NAME BINARY_NAME-linux-amd64-${{ github.ref_name }}
+        run: mv target/release/tableformat tableformat-linux-amd64-${{ github.ref_name }}
       - name: create release with binaries
         uses: softprops/action-gh-release@v1
         with:
-          files: BINARY_NAME-linux-amd64-${{ github.ref_name }}
+          files: tableformat-linux-amd64-${{ github.ref_name }}
